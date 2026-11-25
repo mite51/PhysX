@@ -1,3 +1,6 @@
 compiler/linux-*
 compiler/vc*
 include/PxConfig.h
+# Build outputs: libraries, DLLs, executables and symbols from any preset
+bin/
+install/

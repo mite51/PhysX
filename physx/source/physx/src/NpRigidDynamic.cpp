@@ -29,6 +29,8 @@
 #include "NpRigidDynamic.h"
 #include "NpRigidActorTemplateInternal.h"
 #include "omnipvd/NpOmniPvdSetData.h"
+#include "ScBodySim.h"
+#include "ScSimStateData.h"
 
 using namespace physx;
 
@@ -39,8 +41,11 @@ PX_IMPLEMENT_OUTPUT_ERROR
 ///////////////////////////////////////////////////////////////////////////////
 
 NpRigidDynamic::NpRigidDynamic(const PxTransform& bodyPose)
-:	NpRigidDynamicT(PxConcreteType::eRIGID_DYNAMIC, PxBaseFlag::eOWNS_MEMORY | PxBaseFlag::eIS_RELEASABLE, PxActorType::eRIGID_DYNAMIC, NpType::eBODY, bodyPose)
-{}
+:	NpRigidDynamicT(PxConcreteType::eRIGID_DYNAMIC, PxBaseFlag::eOWNS_MEMORY | PxBaseFlag::eIS_RELEASABLE, PxActorType::eRIGID_DYNAMIC, NpType::eBODY, bodyPose),
+	mPoseCacheValid(false)
+{
+	updatePoseCache(bodyPose);
+}
 
 NpRigidDynamic::~NpRigidDynamic()
 {
@@ -103,10 +108,16 @@ void NpRigidDynamic::setGlobalPose(const PxTransform& pose, bool autowake)
 		return;
 	}
 
-	const PxTransform newPose = pose.getNormalized();	//AM: added to fix 1461 where users read and write orientations for no reason.
-	
+	//AM: added to fix 1461 where users read and write orientations for no reason.
+	// Normalized to a fixed point of PxQuat::getNormalized(), so a pose that is already
+	// normalized is kept verbatim and normalizing what getGlobalPose() reports changes nothing.
+	const PxTransform newPose(pose.p, normalizedFixedPoint(pose.q));
+
 	const PxTransform body2World = newPose * mCore.getBody2Actor();
 	scSetBody2World(body2World);
+
+	// Report back exactly what was set, so set/get round trips are exact.
+	updatePoseCache(newPose);
 
 	OMNI_PVD_WRITE_SCOPE_BEGIN(pvdWriter, pvdRegData)
 	OMNI_PVD_SET_EXPLICIT(pvdWriter, pvdRegData, OMNI_PVD_CONTEXT_HANDLE, PxRigidActor, globalPose, *static_cast<PxRigidActor*>(this), newPose);
@@ -186,7 +197,13 @@ void NpRigidDynamic::setCMassLocalPose(const PxTransform& pose)
 
 	const PxTransform oldBody2Actor = mCore.getBody2Actor();
 
+	// Changing the mass frame must not move the actor. The core re-derives body2World from a
+	// recomputed actor pose, which is lossy, so keep reporting the actor pose from before.
+	const PxTransform actor2World = getGlobalPoseFast();
+
 	NpRigidDynamicT::setCMassLocalPoseInternal(p);
+
+	updatePoseCache(actor2World);
 
 	if(mCore.getFlags() & PxRigidBodyFlag::eKINEMATIC)
 	{
@@ -650,4 +667,161 @@ PxRigidDynamicGPUIndex NpRigidDynamic::getGPUIndex() const
 		return mCore.getInternalIslandNodeIndex().index();
 	}
 	return PX_INVALID_NODE;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Kinematic rollback state
+
+namespace
+{
+	const PxU16 gKinematicPhaseFlags = PxU16(Sc::ActorSim::BF_KINEMATIC_MOVE_FLAGS | Sc::ActorSim::BF_KINEMATIC_SURFACE_VELOCITY);
+
+	// Resolves the simulation objects behind a kinematic body, or returns NULL if the body
+	// is not in a state whose kinematic rollback state is defined and reachable on the CPU.
+	Sc::Kinematic* getKinematicRollbackData(const NpRigidDynamic& np, Sc::BodySim*& simOut, bool forWrite)
+	{
+		simOut = NULL;
+		NpScene* npScene = np.getNpScene();
+		if(!npScene)
+			return NULL;
+		if(forWrite ? npScene->isAPIWriteForbidden() : npScene->isAPIReadForbidden())
+			return NULL;
+		const PxSceneFlags sceneFlags = npScene->getFlagsFast();
+		if(sceneFlags & (PxSceneFlag::eENABLE_GPU_DYNAMICS | PxSceneFlag::eENABLE_DIRECT_GPU_API))
+			return NULL;
+
+		const Sc::BodyCore& core = np.getCore();
+		if(!(core.getFlags() & PxRigidBodyFlag::eKINEMATIC))
+			return NULL;
+		if(core.getActorFlags().isSet(PxActorFlag::eDISABLE_SIMULATION))
+			return NULL;
+
+		Sc::BodySim* sim = core.getSim();
+		if(!sim)
+			return NULL;
+		Sc::SimStateData* simStateData = sim->getSimStateData(true);
+		if(!simStateData)
+			return NULL;
+
+		simOut = sim;
+		return simStateData->getKinematicData();
+	}
+}
+
+bool physx::PxCaptureKinematicRollbackState(const PxRigidDynamic& body, PxKinematicRollbackState& state)
+{
+	PxMemZero(&state, sizeof(state));
+
+	const NpRigidDynamic& np = static_cast<const NpRigidDynamic&>(body);
+	NP_READ_CHECK(np.getNpScene());
+
+	Sc::BodySim* sim;
+	const Sc::Kinematic* kine = getKinematicRollbackData(np, sim, false);
+	if(!kine)
+		return false;
+
+	const Sc::BodyCore& core = np.getCore();
+
+	PxU32 flags = 0;
+	if(kine->targetValid)
+	{
+		flags |= PxKinematicRollbackState::eTARGET_VALID;
+		state.targetPose = kine->targetPose;
+	}
+	if(sim->readInternalFlag(Sc::ActorSim::BF_KINEMATIC_MOVED))
+		flags |= PxKinematicRollbackState::eMOVED;
+	if(sim->readInternalFlag(Sc::ActorSim::BF_KINEMATIC_SETTLING))
+		flags |= PxKinematicRollbackState::eSETTLING;
+	if(sim->readInternalFlag(Sc::ActorSim::BF_KINEMATIC_SETTLING_2))
+		flags |= PxKinematicRollbackState::eSETTLING_2;
+	if(sim->readInternalFlag(Sc::ActorSim::BF_KINEMATIC_SURFACE_VELOCITY))
+		flags |= PxKinematicRollbackState::eSURFACE_VELOCITY;
+	if(sim->isActive())
+		flags |= PxKinematicRollbackState::eACTIVE;
+
+	state.linearVelocity = core.getLinearVelocity();
+	state.angularVelocity = core.getAngularVelocity();
+	state.wakeCounter = core.getWakeCounter();
+	state.flags = flags;
+	return true;
+}
+
+bool physx::PxRestoreKinematicRollbackState(PxRigidDynamic& body, const PxKinematicRollbackState& state)
+{
+	NpRigidDynamic& np = static_cast<NpRigidDynamic&>(body);
+	NP_WRITE_CHECK(np.getNpScene());
+
+	const PxU32 knownFlags = PxKinematicRollbackState::eTARGET_VALID | PxKinematicRollbackState::eMOVED |
+		PxKinematicRollbackState::eSETTLING | PxKinematicRollbackState::eSETTLING_2 |
+		PxKinematicRollbackState::eSURFACE_VELOCITY | PxKinematicRollbackState::eACTIVE;
+	if((state.flags & ~knownFlags) || state.reserved != 0)
+		return false;
+	if(!state.linearVelocity.isFinite() || !state.angularVelocity.isFinite() || !PxIsFinite(state.wakeCounter) || state.wakeCounter < 0.0f)
+		return false;
+	const bool targetValid = (state.flags & PxKinematicRollbackState::eTARGET_VALID) != 0;
+	if(targetValid && !state.targetPose.isSane())
+		return false;
+
+	Sc::BodySim* sim;
+	Sc::Kinematic* kine = getKinematicRollbackData(np, sim, true);
+	if(!kine)
+		return false;
+
+	Sc::BodyCore& core = np.getCore();
+
+	PxU16 phase = 0;
+	if(state.flags & PxKinematicRollbackState::eMOVED)
+		phase |= Sc::ActorSim::BF_KINEMATIC_MOVED;
+	if(state.flags & PxKinematicRollbackState::eSETTLING)
+		phase |= Sc::ActorSim::BF_KINEMATIC_SETTLING;
+	if(state.flags & PxKinematicRollbackState::eSETTLING_2)
+		phase |= Sc::ActorSim::BF_KINEMATIC_SETTLING_2;
+	if(state.flags & PxKinematicRollbackState::eSURFACE_VELOCITY)
+		phase |= Sc::ActorSim::BF_KINEMATIC_SURFACE_VELOCITY;
+
+	// Sleep state first, through the same entry points the simulation controller uses, so
+	// the active lists, island manager and interactions follow. Activation expects a moved
+	// kinematic and deactivation expects one that is not, so the phase flags are staged
+	// around the transition and set exactly afterwards.
+	if(state.flags & PxKinematicRollbackState::eACTIVE)
+	{
+		if(!sim->isActive())
+		{
+			sim->raiseInternalFlag(Sc::ActorSim::BF_KINEMATIC_MOVED);
+			core.wakeUp(state.wakeCounter);
+		}
+	}
+	else
+	{
+		if(sim->isActive())
+		{
+			sim->clearInternalFlag(Sc::ActorSim::InternalFlags(gKinematicPhaseFlags));
+			core.putToSleep();
+		}
+	}
+
+	sim->clearInternalFlag(Sc::ActorSim::InternalFlags(gKinematicPhaseFlags));
+	if(phase)
+		sim->raiseInternalFlag(Sc::ActorSim::InternalFlags(phase));
+
+	if(targetValid)
+	{
+		kine->targetPose = state.targetPose;
+		kine->targetValid = 1;
+	}
+	else
+	{
+		kine->targetPose = PxTransform(PxIdentity);
+		kine->targetValid = 0;
+	}
+
+	core.setLinearVelocity(state.linearVelocity);
+	core.setAngularVelocity(state.angularVelocity);
+	core.setWakeCounterFromSim(state.wakeCounter);
+
+	NpScene* npScene = np.getNpScene();
+	if(targetValid && (core.getFlags() & PxRigidBodyFlag::eUSE_KINEMATIC_TARGET_FOR_SCENE_QUERIES))
+		np.getShapeManager().markActorForSQUpdate(npScene->getSQAPI(), np);
+
+	return true;
 }

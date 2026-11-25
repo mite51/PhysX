@@ -718,6 +718,17 @@ struct EnhancedSortPredicate
 	}
 };
 
+// Shape-based ordering for the articulation contacts, which the compound-constraint path moves to the
+// end of the list. Used with enhanced determinism in place of ArticulationSortPredicate, whose
+// contact-manager index reflects allocation history rather than the pair itself.
+struct EnhancedArticulationSortPredicate
+{
+	bool operator()(const PxsIndexedContactManager*& left, const PxsIndexedContactManager*& right) const
+	{
+		return EnhancedSortPredicate()(*left, *right);
+	}
+};
+
 class PxsSolverStartTask : public Cm::Task
 {
 	PxsSolverStartTask& operator=(const PxsSolverStartTask&);
@@ -859,6 +870,21 @@ public:
 					const IG::Edge& edge = islandSim.getEdge(contactEdgeIndex);
 
 					PxsContactManager* contactManager = mIslandManager.getContactManager(contactEdgeIndex);
+
+					// With enhanced determinism, a pair that currently has no contact points takes no
+					// part in the solve. Such pairs can survive from a discarded (rolled-back) history;
+					// left in, they still group with real pairs when compound constraints are built and
+					// keep stale friction anchors. Clear those anchors as a zero-contact solve would.
+					if(contactManager && mEnhancedDeterminism)
+					{
+						PxcNpWorkUnit& unit = contactManager->getWorkUnit();
+						if(mOutputs.getContactManagerOutput(unit.mNpIndex).nbContacts == 0)
+						{
+							unit.mFrictionDataPtr = NULL;
+							unit.mFrictionPatchCount = 0;
+							contactManager = NULL;
+						}
+					}
 
 					if(contactManager)
 					{
@@ -1147,7 +1173,10 @@ public:
 #if 1
 				{
 					PX_PROFILE_ZONE("PxSort", mContextID);
-					PxSort(constraints + articulationStartIndex, accumulatedCount - articulationStartIndex, ArticulationSortPredicate());
+					if(mEnhancedDeterminism)
+						PxSort(constraints + articulationStartIndex, accumulatedCount - articulationStartIndex, EnhancedArticulationSortPredicate());
+					else
+						PxSort(constraints + articulationStartIndex, accumulatedCount - articulationStartIndex, ArticulationSortPredicate());
 				}
 #endif
 			}

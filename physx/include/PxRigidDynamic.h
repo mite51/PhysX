@@ -469,6 +469,72 @@ protected:
 	virtual		bool				isKindOf(const char* name) const { PX_IS_KIND_OF(name, "PxRigidDynamic", PxRigidBody); }
 };
 
+/**
+\brief Simulation-controller state of a kinematic rigid dynamic that the public API cannot read or write.
+
+A kinematic body carries more state than its pose: a pending kinematic target, the velocity computed from
+the last target, its movement/settling phase (a kinematic stays awake for two steps after its last target
+before it goes to sleep), its wake counter and whether it is currently active. Restoring only the pose
+and replaying the same inputs therefore does not reproduce the same simulation. This blob captures
+exactly that state so a rollback can put it back.
+
+The layout is plain data with no padding: every member is 4 bytes wide, so the struct can be stored
+bytewise in a snapshot and compared bytewise. Its contents are build-specific and must only be restored
+into a body constructed the same way (same center-of-mass frame) by the same PhysX build.
+
+\note CPU scenes only. Capture and restore fail (return false) for scenes with GPU dynamics or the direct
+GPU API enabled, for bodies that are not kinematic, not in a scene, or have simulation disabled, and while
+the scene is simulating.
+
+\see PxCaptureKinematicRollbackState PxRestoreKinematicRollbackState
+*/
+struct PxKinematicRollbackState
+{
+	PxTransform	targetPose;			//!< Pending kinematic target in body (center-of-mass) space. Zero when there is none.
+	PxVec3		linearVelocity;		//!< Center-of-mass linear velocity computed from the last target.
+	PxVec3		angularVelocity;	//!< Angular velocity computed from the last target.
+	PxReal		wakeCounter;		//!< Wake counter.
+	PxU32		flags;				//!< Combination of PxKinematicRollbackState::Enum bits.
+	PxU32		reserved;			//!< Always zero.
+
+	enum Enum
+	{
+		eTARGET_VALID		= (1 << 0),	//!< A kinematic target is pending.
+		eMOVED				= (1 << 1),	//!< The body was moved by a target and has not started settling.
+		eSETTLING			= (1 << 2),	//!< First settling step after the last target.
+		eSETTLING_2			= (1 << 3),	//!< Second settling step; the body sleeps after it.
+		eSURFACE_VELOCITY	= (1 << 4),	//!< Kept awake by a kinematic surface velocity.
+		eACTIVE				= (1 << 5)	//!< The body is awake (part of the active body list).
+	};
+};
+PX_COMPILE_TIME_ASSERT(sizeof(PxKinematicRollbackState) == 64);
+
+/**
+\brief Captures the kinematic rollback state of a kinematic rigid dynamic.
+
+\param[in] body		Kinematic rigid dynamic in a CPU scene.
+\param[out] state	Receives the state. Zeroed on failure.
+\return True on success.
+
+\see PxKinematicRollbackState PxRestoreKinematicRollbackState
+*/
+PX_PHYSX_CORE_API bool PxCaptureKinematicRollbackState(const PxRigidDynamic& body, PxKinematicRollbackState& state);
+
+/**
+\brief Restores kinematic rollback state previously captured with PxCaptureKinematicRollbackState().
+
+Restores the pending target, velocities, movement/settling phase, wake counter and sleep state immediately,
+without advancing time. Restore the global pose first (PxRigidActor::setGlobalPose with autowake false);
+this function does not change it.
+
+\param[in] body		Kinematic rigid dynamic in a CPU scene.
+\param[in] state	State to restore.
+\return True on success. On failure the body is unchanged.
+
+\see PxKinematicRollbackState PxCaptureKinematicRollbackState
+*/
+PX_PHYSX_CORE_API bool PxRestoreKinematicRollbackState(PxRigidDynamic& body, const PxKinematicRollbackState& state);
+
 #if !PX_DOXYGEN
 } // namespace physx
 #endif

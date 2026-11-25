@@ -754,6 +754,20 @@ void DynamicsTGSContext::updatePostKinematic(IG::SimpleIslandManager& simpleIsla
 	mergeTask->removeReference();
 }
 
+// Orders contact managers by their two shapes' transform-cache IDs. Those IDs are assigned at
+// shape registration and do not depend on when a pair started touching, unlike the island edge
+// order, which records contact-creation history. Matches the ordering PGS uses (DyDynamics.cpp).
+struct EnhancedSortPredicateTGS
+{
+	bool operator()(const PxsIndexedContactManager& left, const PxsIndexedContactManager& right) const
+	{
+		const PxcNpWorkUnit& unit0 = left.contactManager->getWorkUnit();
+		const PxcNpWorkUnit& unit1 = right.contactManager->getWorkUnit();
+		return (unit0.mTransformCache0 < unit1.mTransformCache0) ||
+			((unit0.mTransformCache0 == unit1.mTransformCache0) && (unit0.mTransformCache1 < unit1.mTransformCache1));
+	}
+};
+
 void DynamicsTGSContext::prepareBodiesAndConstraints(const SolverIslandObjectsStep& objects,
 	IG::SimpleIslandManager& islandManager, IslandContextStep& islandContext)
 {
@@ -839,6 +853,22 @@ void DynamicsTGSContext::prepareBodiesAndConstraints(const SolverIslandObjectsSt
 
 				PxsContactManager* contactManager = islandManager.getContactManager(contactEdgeIndex);
 
+				// With enhanced determinism, a pair that currently has no contact points takes no
+				// part in the solve. Such pairs can survive from a discarded (rolled-back) history
+				// and would otherwise still occupy solver bodies during constraint partitioning,
+				// moving where real contacts are solved. Their friction anchors are stale too, so
+				// they are cleared as a zero-contact solve would have cleared them.
+				if (contactManager && mUseEnhancedDeterminism)
+				{
+					PxcNpWorkUnit& unit = contactManager->getWorkUnit();
+					if (mOutputIterator.getContactManagerOutput(unit.mNpIndex).nbContacts == 0)
+					{
+						unit.mFrictionDataPtr = NULL;
+						unit.mFrictionPatchCount = 0;
+						contactManager = NULL;
+					}
+				}
+
 				if (contactManager)
 				{
 					const PxNodeIndex nodeIndex1 = islandSim.mCpuData.getNodeIndex1(contactEdgeIndex);
@@ -907,6 +937,12 @@ void DynamicsTGSContext::prepareBodiesAndConstraints(const SolverIslandObjectsSt
 				contactEdgeIndex = edge.mNextIslandEdge;
 			}
 		}
+
+		// The island edge order depends on when each pair started touching, which differs between
+		// peers that simulated different speculative histories. Remove that history from the
+		// solve order, as PGS does.
+		if (mUseEnhancedDeterminism)
+			PxSort(indexedManagers, currentContactIndex, EnhancedSortPredicateTGS());
 
 		islandContext.mCounts.contactManagers = currentContactIndex;
 	}

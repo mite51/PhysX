@@ -40,7 +40,7 @@ class NpRigidDynamic : public NpRigidDynamicT
 {
 public:
 // PX_SERIALIZATION
-									NpRigidDynamic(PxBaseFlags baseFlags) : NpRigidDynamicT(baseFlags) {}
+									NpRigidDynamic(PxBaseFlags baseFlags) : NpRigidDynamicT(baseFlags), mPoseCacheValid(false) {}
 
 				void				preExportDataReset();
 	virtual		void				requiresObjects(PxProcessPxBaseCallback& c);
@@ -62,8 +62,44 @@ public:
 	PX_FORCE_INLINE	PxTransform		getGlobalPoseFast() const
 	{
 		const Sc::BodyCore& body = getCore();
+
+		// The core stores the center-of-mass frame, so the actor pose is derived and
+		// body2World * body2Actor^-1 does not in general return the pose that produced
+		// body2World. When the core still holds exactly the frames the cache was built
+		// from, answer with the actor pose that built them so set/get round trips are exact.
+		if(mPoseCacheValid && poseCacheMatches(body))
+			return mPoseCacheActor2World;
+
 		// PT:: tag: scalar transform*transform
-		return body.getBody2World() * body.getBody2Actor().getInverse();
+		const PxTransform derived = body.getBody2World() * body.getBody2Actor().getInverse();
+
+		// Normalizing is not idempotent in floating point. A caller that canonicalizes the pose
+		// it reads (as a snapshot does) and writes it back reads back the canonical pose, so the
+		// round trip is exact only if that canonical pose is a fixed point of getNormalized().
+		// It almost always is, and then the derived pose is reported unchanged; otherwise report
+		// the fixed point itself.
+		const PxQuat n = derived.q.getNormalized();
+		if(isNormalizedFixedPoint(n))
+			return derived;
+		return PxTransform(derived.p, normalizedFixedPoint(n));
+	}
+
+	static PX_FORCE_INLINE bool		isNormalizedFixedPoint(const PxQuat& q)
+	{
+		const PxQuat n = q.getNormalized();
+		return n.x == q.x && n.y == q.y && n.z == q.z && n.w == q.w;
+	}
+
+	static PX_FORCE_INLINE PxQuat	normalizedFixedPoint(PxQuat q)
+	{
+		for(PxU32 i = 0; i < 4; i++)
+		{
+			const PxQuat n = q.getNormalized();
+			if(n.x == q.x && n.y == q.y && n.z == q.z && n.w == q.w)
+				break;
+			q = n;
+		}
+		return q;
 	}
 
 	virtual		PxTransform			getGlobalPose() const	PX_OVERRIDE PX_FINAL
@@ -136,6 +172,35 @@ public:
 
 private:
 	PX_FORCE_INLINE	void			setKinematicTargetInternal(const PxTransform& destination);
+
+	static PX_FORCE_INLINE bool		bitwiseEqual(const PxTransform& a, const PxTransform& b)
+	{
+		return	a.p.x == b.p.x && a.p.y == b.p.y && a.p.z == b.p.z &&
+				a.q.x == b.q.x && a.q.y == b.q.y && a.q.z == b.q.z && a.q.w == b.q.w;
+	}
+
+	PX_FORCE_INLINE	bool			poseCacheMatches(const Sc::BodyCore& body) const
+	{
+		return bitwiseEqual(body.getBody2World(), mPoseCacheBody2World) && bitwiseEqual(body.getBody2Actor(), mPoseCacheBody2Actor);
+	}
+
+	// Records actor2World as the exact actor pose for the core's current frames.
+	PX_FORCE_INLINE	void			updatePoseCache(const PxTransform& actor2World)
+	{
+		const Sc::BodyCore& body = getCore();
+		mPoseCacheActor2World = actor2World;
+		mPoseCacheBody2World = body.getBody2World();
+		mPoseCacheBody2Actor = body.getBody2Actor();
+		mPoseCacheValid = true;
+	}
+
+	// Exact actor pose for a body that was placed or created through the API, keyed on the
+	// center-of-mass frames that pose produced. Any write to either frame (simulation,
+	// kinematic target, teleport, mass frame change) invalidates it implicitly.
+	PxTransform						mPoseCacheActor2World;
+	PxTransform						mPoseCacheBody2World;
+	PxTransform						mPoseCacheBody2Actor;
+	bool							mPoseCacheValid;
 
 #if PX_ENABLE_DEBUG_VISUALIZATION
 public:
